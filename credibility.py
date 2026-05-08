@@ -19,8 +19,8 @@ Output structure (every call returns all four components):
   4. recommendation    — "use_freely" | "use_with_caution" | "avoid"
 
 Scoring:
-  Baseline: 65 (elevated above 50 to compensate for the absence of domain-age
-  and backlink metadata that a full check would use).
+  Baseline: 70 (set at the use_freely threshold so a clean page with no signals
+  passes by default — positive signals are upside bonuses, not requirements).
   Red flags deduct 8–12 points each depending on severity.
   Positive signals add 5 points each.
   3+ tactics detected triggers an additional -15 penalty.
@@ -137,7 +137,7 @@ _REDDIT_DOMAINS: frozenset[str] = frozenset(["reddit.com", "old.reddit.com"])
 # Scoring constants
 # ---------------------------------------------------------------------------
 
-_BASELINE_SCORE: int = 65
+_BASELINE_SCORE: int = 70
 _POSITIVE_SIGNAL_BONUS: int = 5
 _MULTI_TACTIC_PENALTY: int = 15  # extra penalty when 3+ tactics detected
 

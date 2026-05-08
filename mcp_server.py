@@ -123,7 +123,7 @@ def scrape_url_with_credibility(
     it does not block access.  Confidence degrades for short or ambiguous
     content (see credibility.py and KNOWN_LIMITS.md for details).
 
-    Scoring: baseline 65, -8 to -12 per detected tactic, +5 per positive
+    Scoring: baseline 70, -8 to -12 per detected tactic, +5 per positive
     signal, -15 extra penalty when 3+ tactics detected.  Trusted healthcare/
     news domains (HIMSS, AHA, CMS, Reuters, NYT, Fierce Healthcare, etc.)
     are protected by a 70-point score floor.  No external API is called.

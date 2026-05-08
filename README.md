@@ -127,17 +127,47 @@ python scraper.py https://example.com --output scraped.txt
 python credibility.py https://example.com scraped.txt
 ```
 
-### MCP server (Claude Code)
+### Using as a Claude Code / MCP skill
 
+This is the recommended way to use safe-scraper. Once registered as an MCP server, all three tools are available to Claude Code and any agent that supports MCP — no manual invocation needed.
+
+**Step 1 — Clone and install**
 ```bash
-# Register
-claude mcp add scraper -- python /path/to/mcp_server.py
-
-# Run
-python mcp_server.py
+git clone https://github.com/belowthestack/safe-scraper.git
+cd safe-scraper
+pip install -r requirements.txt
+playwright install chromium
 ```
 
-Once registered, use `scrape_url_with_credibility` in any Claude Code session to get text + credibility in one call.
+**Step 2 — Register the MCP server with Claude Code**
+```bash
+claude mcp add scraper -- python C:/path/to/safe-scraper/mcp_server.py
+```
+Replace `C:/path/to/safe-scraper/` with the actual path where you cloned the repo.
+
+**Step 3 — Verify it's registered**
+```bash
+claude mcp list
+```
+You should see `scraper` in the list.
+
+**Step 4 — Use it**
+
+In any Claude Code session, you now have three tools available:
+
+| Tool | What to say to Claude | Returns |
+|---|---|---|
+| `scrape_url` | "Scrape this URL: ..." | Plain text |
+| `scrape_batch` | "Scrape these URLs: ..." | Dict of URL → text |
+| `scrape_url_with_credibility` | "Scrape and score this URL: ..." | Text + full credibility JSON |
+
+Claude will call the tool automatically when the context calls for it, or you can ask for it explicitly: *"Use scrape_url_with_credibility on this URL and tell me the risk level."*
+
+**No Claude Code? Run it standalone:**
+```bash
+python mcp_server.py
+```
+The server runs on stdio and is compatible with any MCP-capable client.
 
 ---
 

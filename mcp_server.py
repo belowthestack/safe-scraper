@@ -16,7 +16,9 @@ Run with: python mcp_server.py
 Register with Claude Code: claude mcp add scraper -- python C:\Users\Arfa\Desktop\tools\scraper\mcp_server.py
 """
 
+import asyncio
 import concurrent.futures
+from functools import partial
 
 from mcp.server.fastmcp import FastMCP
 
@@ -27,7 +29,7 @@ mcp = FastMCP("scraper")
 
 
 @mcp.tool()
-def scrape_url(url: str, force_dynamic: bool = False, force_static: bool = False) -> str:
+async def scrape_url(url: str, force_dynamic: bool = False, force_static: bool = False) -> str:
     """Fetch a single URL and return clean AI-readable plain text.
 
     Uses a hybrid static-first then Playwright-fallback strategy by default.
@@ -47,13 +49,15 @@ def scrape_url(url: str, force_dynamic: bool = False, force_static: bool = False
         Scraped plain text, or an 'ERROR: <type>: <message>' string on failure.
     """
     try:
-        return scrape(url, force_dynamic=force_dynamic, force_static=force_static)
+        return await asyncio.to_thread(
+            scrape, url, force_dynamic=force_dynamic, force_static=force_static
+        )
     except Exception as exc:
         return f"ERROR: {type(exc).__name__}: {exc}"
 
 
 @mcp.tool()
-def scrape_batch(
+async def scrape_batch(
     urls: list[str],
     force_dynamic: bool = False,
     force_static: bool = False,
@@ -79,28 +83,29 @@ def scrape_batch(
         Dict mapping each URL to its scraped plain text or an 'ERROR: ...' string.
     """
     max_workers = max(1, min(10, max_workers))
-    results: dict[str, str] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_url: dict[concurrent.futures.Future[str], str] = {
-            executor.submit(
-                scrape, url, force_dynamic=force_dynamic, force_static=force_static
-            ): url
-            for url in urls
-        }
+    def _run_batch() -> dict[str, str]:
+        results: dict[str, str] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_url: dict[concurrent.futures.Future[str], str] = {
+                executor.submit(
+                    scrape, url, force_dynamic=force_dynamic, force_static=force_static
+                ): url
+                for url in urls
+            }
+            for future in concurrent.futures.as_completed(future_to_url):
+                u = future_to_url[future]
+                try:
+                    results[u] = future.result()
+                except Exception as exc:
+                    results[u] = f"ERROR: {type(exc).__name__}: {exc}"
+        return results
 
-        for future in concurrent.futures.as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                results[url] = future.result()
-            except Exception as exc:
-                results[url] = f"ERROR: {type(exc).__name__}: {exc}"
-
-    return results
+    return await asyncio.to_thread(_run_batch)
 
 
 @mcp.tool()
-def scrape_url_with_credibility(
+async def scrape_url_with_credibility(
     url: str,
     force_dynamic: bool = False,
     force_static: bool = False,
@@ -140,8 +145,8 @@ def scrape_url_with_credibility(
                           present — never just a pass/fail)
     """
     try:
-        text, raw_html = scrape_with_raw(
-            url, force_dynamic=force_dynamic, force_static=force_static
+        text, raw_html = await asyncio.to_thread(
+            scrape_with_raw, url, force_dynamic=force_dynamic, force_static=force_static
         )
     except Exception as exc:
         text = f"ERROR: {type(exc).__name__}: {exc}"

@@ -1,14 +1,19 @@
 r"""
-MCP server wrapping the credibility scraper as a Claude Code native tool.
+MCP server wrapping the personal scraper as a Claude Code native tool.
 
 Exposes three tools:
   - scrape_url: fetches a single URL and returns clean AI-readable plain text
   - scrape_batch: scrapes multiple URLs in parallel using a thread pool
-  - scrape_url_with_credibility: fetches a URL and runs a credibility assessment
-    on the returned content, flagging manipulation tactics without blocking access
+  - scrape_url_with_credibility: fetches a URL and runs a credibility-risk
+    triage on the returned content — scores and flags signals for human review
+    without blocking access to the content
+
+The credibility layer is advisory.  The scraper always returns text; the
+credibility score is a risk signal to guide prioritisation, not a gate.
+See KNOWN_LIMITS.md for failure modes before using this in automated pipelines.
 
 Run with: python mcp_server.py
-Register with Claude Code: claude mcp add scraper -- python /path/to/mcp_server.py
+Register with Claude Code: claude mcp add scraper -- python C:\Users\Arfa\Desktop\tools\scraper\mcp_server.py
 """
 
 import concurrent.futures
@@ -16,7 +21,7 @@ import concurrent.futures
 from mcp.server.fastmcp import FastMCP
 
 from credibility import assess_credibility
-from scraper import scrape
+from scraper import scrape, scrape_with_raw
 
 mcp = FastMCP("scraper")
 
@@ -100,19 +105,28 @@ def scrape_url_with_credibility(
     force_dynamic: bool = False,
     force_static: bool = False,
 ) -> dict:
-    """Fetch a URL and return both the scraped text and a credibility assessment.
+    """Fetch a URL and return scraped text plus a credibility-risk triage.
 
-    Combines the scraper with the credibility module to give a richer result.
-    The credibility assessment analyses content-only signals — it does NOT call
-    any external API (no domain-age lookup, no backlink API).  Scoring starts at
-    65, deducts 8-12 points per detected manipulation tactic, adds 5 points per
-    positive credibility signal, and applies an additional -15 penalty when 3 or
-    more tactics are detected.  Trusted healthcare/news domains (HIMSS, AHA,
-    CMS, Reuters, NYT, Fierce Healthcare, etc.) are protected by a 70-point
-    score floor.
+    Combines the scraper with the credibility-risk layer to give a structured
+    four-component result every time:
+      1. Raw content      — "text" key: scraped plain text, always present
+      2. Extracted signals — "credibility.red_flags" (per-tactic evidence) and
+                             "credibility.positive_signals"
+      3. Assessment       — "credibility.credibility_score" (0–100),
+                             "credibility.risk_level", "credibility.confidence",
+                             "credibility.assessment_summary"
+      4. Recommendation   — "credibility.recommendation":
+                             "use_freely" | "use_with_caution" | "avoid"
 
-    The scraper ALWAYS returns text regardless of the credibility score.  The
-    assessment is advisory — it flags signals, it does not block access.
+    The credibility layer is advisory.  The scraper always returns text
+    regardless of the score — the assessment flags signals for human review,
+    it does not block access.  Confidence degrades for short or ambiguous
+    content (see credibility.py and KNOWN_LIMITS.md for details).
+
+    Scoring: baseline 65, -8 to -12 per detected tactic, +5 per positive
+    signal, -15 extra penalty when 3+ tactics detected.  Trusted healthcare/
+    news domains (HIMSS, AHA, CMS, Reuters, NYT, Fierce Healthcare, etc.)
+    are protected by a 70-point score floor.  No external API is called.
 
     Args:
         url: The URL to fetch and assess.
@@ -120,18 +134,20 @@ def scrape_url_with_credibility(
         force_static: If True, use requests only — no browser fallback.
 
     Returns:
-        A dict with two keys:
+        A dict with two top-level keys:
           "text"        — scraped plain text (or "ERROR: ..." string on failure)
-          "credibility" — CredibilityReport dict with score, risk_level,
-                          detected_tactics, red_flags, positive_signals,
-                          assessment_summary, recommendation, and confidence
+          "credibility" — CredibilityReport dict (all four components always
+                          present — never just a pass/fail)
     """
     try:
-        text = scrape(url, force_dynamic=force_dynamic, force_static=force_static)
+        text, raw_html = scrape_with_raw(
+            url, force_dynamic=force_dynamic, force_static=force_static
+        )
     except Exception as exc:
         text = f"ERROR: {type(exc).__name__}: {exc}"
+        raw_html = ""
 
-    credibility = assess_credibility(text, url)
+    credibility = assess_credibility(text, url, raw_html=raw_html)
 
     return {"text": text, "credibility": credibility}
 

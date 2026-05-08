@@ -1,19 +1,40 @@
 """
-Credibility Assessor — Content-Only Blackhat Signal Detector
+Credibility Risk Layer — Content-Only Signal Scorer for Scraped Text
 
-Analyses already-scraped text + a URL and returns a structured credibility
-assessment WITHOUT calling any external API.  All scoring is based on
-content patterns, writing signals, and URL structure only.
+Analyses already-scraped text + a URL and returns a structured credibility-risk
+assessment WITHOUT calling any external API.  All scoring is based on content
+patterns, writing signals, and URL structure only.
 
-Scoring baseline: 65 (elevated above 50 to compensate for the absence of
-domain-age and backlink metadata that a full check would use).
+This module is a credibility-RISK TRIAGE layer, not a truth engine.  It scores
+and flags signals so you can prioritise human review — it does not block access
+to content, and it cannot guarantee that flagged content is malicious or that
+clean-scoring content is trustworthy.  See KNOWN_LIMITS.md for a full list of
+known failure modes before relying on this in any automated pipeline.
 
-Red flags deduct 8–12 points each depending on severity.
-Positive signals add 5 points each.
-3+ tactics detected triggers an additional -15 penalty.
-Score is clamped to [0, 100].
+Output structure (every call returns all four components):
+  1. source_url        — the URL being assessed (raw, unmodified)
+  2. extracted signals — red_flags (per-tactic evidence) + positive_signals
+  3. credibility assessment — credibility_score, risk_level, confidence,
+                              assessment_summary
+  4. recommendation    — "use_freely" | "use_with_caution" | "avoid"
 
-Calibration guarantee:
+Scoring:
+  Baseline: 65 (elevated above 50 to compensate for the absence of domain-age
+  and backlink metadata that a full check would use).
+  Red flags deduct 8–12 points each depending on severity.
+  Positive signals add 5 points each.
+  3+ tactics detected triggers an additional -15 penalty.
+  Score is clamped to [0, 100].
+
+Confidence score:
+  Starts at 80.  Drops to 30 for content under 100 words, 50 for under 300,
+  65 for under 500.  When content is short or ambiguous, the assessment is
+  explicitly less reliable — the confidence field encodes this so callers can
+  weight results appropriately.  When input is ambiguous and no strong signal
+  fires, the recommendation defaults to "use_with_caution" (medium-risk default)
+  rather than a binary pass/fail.
+
+Calibration notes:
   Established healthcare/news sources (HIMSS, AHA, MGMA, CMS, Reuters, AP,
   NYT, Fierce Healthcare, Modern Healthcare, Health Affairs) score 70+ even
   when press-release language is present.
@@ -183,7 +204,7 @@ def _sentence_count(text: str) -> int:
 def _detect_fake_social_proof(text: str, url: str) -> tuple[bool, str]:
     """FAKE_SOCIAL_PROOF — inflated, generic review language.
 
-    Looks for high density of short praise phrases (<=20-word chunks),
+    Looks for high density of short praise phrases (≤20-word chunks),
     no specific feature or outcome mentions, and suspiciously uniform
     superlative language typical of bulk fake reviews.
     """
@@ -197,7 +218,7 @@ def _detect_fake_social_proof(text: str, url: str) -> tuple[bool, str]:
     if len(praise_phrases) < 4:
         return False, ""
 
-    # Count short sentences (<=20 words) relative to total sentences
+    # Count short sentences (≤20 words) relative to total sentences
     sentences = re.split(r"[.!?]+", text)
     short_sentences = [s for s in sentences if 0 < len(s.split()) <= 20]
     short_ratio = len(short_sentences) / max(1, len(sentences))
@@ -557,6 +578,8 @@ def _detect_prompt_injection(text: str, url: str) -> tuple[bool, str]:
 
     Looks for directive language, LLM instruction patterns, and attempts
     to override AI behaviour that should never appear in a genuine article.
+    Checks plain text only — see scan_raw_html_for_injection() for hidden
+    HTML vectors (display:none, HTML comments, etc.).
     """
     injection_patterns = [
         r"ignore (previous|prior|all|your) (instructions?|context|rules?)",
@@ -580,6 +603,136 @@ def _detect_prompt_injection(text: str, url: str) -> tuple[bool, str]:
         return True, f"Injection patterns found: {'; '.join(hits[:2])}"
 
     return False, ""
+
+
+# ---------------------------------------------------------------------------
+# Hidden HTML injection scanner (raw HTML — runs BEFORE clean_html strips it)
+# ---------------------------------------------------------------------------
+
+_INJECTION_PATTERNS: list[str] = [
+    r"ignore (previous|prior|all|your) (instructions?|context|rules?)",
+    r"when (asked|prompted) (about|to)\s+.{0,50}(always|never|say|respond)",
+    r"you (are now|must|should|will) (act as|pretend|ignore|disregard)",
+    r"(new|updated) (instructions?|system (prompt|message|context))[:—]",
+    r"<(system|instruction|context|prompt)>",
+    r"\[INST\]|\[SYS\]|\[SYSTEM\]",
+    r"do not reveal|do not mention|keep (this|these) (secret|hidden|confidential)",
+    r"override (safety|content|moderation|guidelines?)",
+    r"(assistant|ai|llm|model)[,:]?\s+(you (must|should|will|are to)|please)\b",
+    r"\bprompt[:\s]+.{0,80}(ignore|forget|disregard|override)\b",
+]
+
+
+def scan_raw_html_for_injection(raw_html: str) -> tuple[bool, list[str]]:
+    """Scan raw HTML for prompt-injection patterns before text cleaning.
+
+    clean_html() calls soup.get_text() which destroys hidden HTML — so
+    injection payloads embedded in display:none elements, HTML comments,
+    zero-opacity containers, off-screen divs, and aria-hidden nodes are
+    invisible to the plain-text detector.  This function checks the raw
+    HTML before any cleaning happens.
+
+    Checks:
+      - HTML comments (<!-- ... -->) containing injection directives
+      - Elements with display:none / visibility:hidden / opacity:0 style
+      - Elements with aria-hidden="true" containing instruction-like text
+      - Elements positioned off-screen (left:-9999px or top:-9999px)
+      - Elements with font-size:0 or color matching background (white-on-white)
+      - <meta> tags with suspicious content attributes
+      - Any element whose text content matches injection patterns above
+
+    Args:
+        raw_html: Unprocessed HTML string from requests or Playwright.
+
+    Returns:
+        (flagged, findings) where flagged is True if any hidden injection
+        pattern was found, and findings is a list of human-readable
+        descriptions of what was detected.
+    """
+    if not raw_html:
+        return False, []
+
+    try:
+        from bs4 import BeautifulSoup  # noqa: PLC0415
+        soup = BeautifulSoup(raw_html, "lxml")
+    except Exception:
+        return False, []
+
+    findings: list[str] = []
+
+    # 1. HTML comments containing injection directives
+    from bs4 import Comment  # noqa: PLC0415
+    for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        comment_text = str(comment).strip()
+        for pattern in _INJECTION_PATTERNS:
+            if re.search(pattern, comment_text, flags=re.IGNORECASE):
+                snippet = comment_text[:120].replace("\n", " ")
+                findings.append(f"HTML comment injection: «{snippet}»")
+                break
+
+    # 2. Elements hidden via CSS — display:none, visibility:hidden,
+    #    opacity:0, font-size:0, or off-screen positioning
+    _HIDDEN_STYLE_PATTERNS = re.compile(
+        r"(display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0"
+        r"|font-size\s*:\s*0|left\s*:\s*-\d{3,}px|top\s*:\s*-\d{3,}px"
+        r"|position\s*:\s*absolute[^;]*left\s*:\s*-)",
+        re.IGNORECASE,
+    )
+    for el in soup.find_all(style=True):
+        style_val = el.get("style", "")
+        if _HIDDEN_STYLE_PATTERNS.search(style_val):
+            el_text = el.get_text(separator=" ", strip=True)
+            if not el_text:
+                continue
+            for pattern in _INJECTION_PATTERNS:
+                if re.search(pattern, el_text, flags=re.IGNORECASE):
+                    snippet = el_text[:120].replace("\n", " ")
+                    findings.append(
+                        f"Hidden element injection (style='{style_val[:60]}'): «{snippet}»"
+                    )
+                    break
+
+    # 3. aria-hidden="true" elements with instruction-like text
+    for el in soup.find_all(attrs={"aria-hidden": "true"}):
+        el_text = el.get_text(separator=" ", strip=True)
+        if not el_text:
+            continue
+        for pattern in _INJECTION_PATTERNS:
+            if re.search(pattern, el_text, flags=re.IGNORECASE):
+                snippet = el_text[:120].replace("\n", " ")
+                findings.append(f"aria-hidden injection: «{snippet}»")
+                break
+
+    # 4. <meta> tags with suspicious content attributes
+    for meta in soup.find_all("meta", content=True):
+        content_val = meta.get("content", "")
+        for pattern in _INJECTION_PATTERNS:
+            if re.search(pattern, content_val, flags=re.IGNORECASE):
+                snippet = content_val[:120].replace("\n", " ")
+                findings.append(f"<meta> tag injection: «{snippet}»")
+                break
+
+    # 5. White-on-white / same-color text: color and background-color match
+    #    common camouflage pattern (#fff on white, #ffffff, rgb(255,255,255))
+    _WHITE_COLOR = re.compile(
+        r"color\s*:\s*(#fff{1,3}|#ffffff|white|rgb\(255\s*,\s*255\s*,\s*255\))",
+        re.IGNORECASE,
+    )
+    for el in soup.find_all(style=True):
+        style_val = el.get("style", "")
+        if _WHITE_COLOR.search(style_val):
+            el_text = el.get_text(separator=" ", strip=True)
+            if not el_text:
+                continue
+            for pattern in _INJECTION_PATTERNS:
+                if re.search(pattern, el_text, flags=re.IGNORECASE):
+                    snippet = el_text[:120].replace("\n", " ")
+                    findings.append(
+                        f"White-on-white text injection: «{snippet}»"
+                    )
+                    break
+
+    return bool(findings), findings
 
 
 def _detect_scripted_influencer(text: str, url: str) -> tuple[bool, str]:
@@ -747,20 +900,49 @@ _DETECTORS: list[
 ]
 
 
-def assess_credibility(text: str, url: str) -> CredibilityReport:
-    """Assess the credibility of already-scraped content.
+def assess_credibility(text: str, url: str, raw_html: str = "") -> CredibilityReport:
+    """Score and triage credibility risk for already-scraped content.
 
-    This function is the primary entry point.  It runs all 10 tactic
-    detectors and all positive signal detectors, computes a score, and
-    returns a structured CredibilityReport dict.
+    This is the primary entry point for the credibility-risk layer.  It runs
+    all 10 tactic detectors and all positive signal detectors, computes a
+    weighted score with a per-flag confidence model, and returns a structured
+    CredibilityReport containing all four output components:
+
+      1. Raw source reference  — source_url (unchanged, always returned)
+      2. Extracted signals     — red_flags (list of {tactic, evidence} dicts)
+                                 positive_signals (list of human-readable strings)
+      3. Credibility assessment — credibility_score (0–100), risk_level
+                                  ("low"/"medium"/"high"), confidence (0–100),
+                                  assessment_summary
+      4. Recommendation        — "use_freely" | "use_with_caution" | "avoid"
+
+    The scraper always returns text.  This assessment is advisory — it flags
+    signals for human review, it does not block content access.
+
+    Confidence model:
+      Confidence starts at 80 and degrades for short or ambiguous content:
+        < 100 words → confidence 30
+        < 300 words → confidence 50
+        < 500 words → confidence 65
+      Trusted-domain URLs receive a +10 confidence bonus.
+      When confidence is low, treat the score as directional, not definitive.
+      When content is short or no strong signal fires, risk_level defaults to
+      "medium" and recommendation to "use_with_caution" rather than a false
+      pass or fail.
 
     Args:
-        text: The plain-text content returned by the scraper.
-        url:  The source URL from which the text was scraped.
+        text:     The plain-text content returned by the scraper.
+        url:      The source URL from which the text was scraped.
+        raw_html: Optional raw HTML string from the fetcher.  When supplied,
+                  scan_raw_html_for_injection() checks hidden elements, HTML
+                  comments, aria-hidden nodes, meta tags, and white-on-white
+                  text for injection payloads that clean_html() would destroy.
+                  Pass the unprocessed HTML from requests.text or
+                  playwright page.content() before calling clean_html().
 
     Returns:
-        A CredibilityReport TypedDict with score, risk level, detected
-        tactics, positive signals, and actionable recommendation.
+        A CredibilityReport TypedDict.  All four output components are always
+        present — never just a pass/fail.  See module docstring for details.
     """
     trusted = _is_trusted(url)
     word_count = _word_count(text)
@@ -774,6 +956,27 @@ def assess_credibility(text: str, url: str) -> CredibilityReport:
         if flagged:
             detected_tactics.append(tactic_id)
             red_flags.append({"tactic": tactic_id, "evidence": evidence})
+
+    # --- Hidden HTML injection scan (raw HTML path) ---
+    # Must run BEFORE clean_html() strips invisible elements.  Only adds to
+    # PROMPT_INJECTION if it hasn't already been caught in plain text.
+    if raw_html and "PROMPT_INJECTION" not in detected_tactics:
+        html_flagged, html_findings = scan_raw_html_for_injection(raw_html)
+        if html_flagged:
+            detected_tactics.append("PROMPT_INJECTION")
+            red_flags.append({
+                "tactic": "PROMPT_INJECTION",
+                "evidence": "Hidden HTML injection: " + "; ".join(html_findings[:2]),
+            })
+    elif raw_html and "PROMPT_INJECTION" in detected_tactics:
+        # Already flagged in plain text — augment evidence with HTML details
+        _, html_findings = scan_raw_html_for_injection(raw_html)
+        if html_findings:
+            for flag in red_flags:
+                if flag["tactic"] == "PROMPT_INJECTION":
+                    flag["evidence"] += (
+                        " + hidden HTML vectors: " + "; ".join(html_findings[:2])
+                    )
 
     # --- Run positive signal detectors ---
     positive_signals = _detect_positive_signals(text, url)
@@ -798,6 +1001,20 @@ def assess_credibility(text: str, url: str) -> CredibilityReport:
 
     # Clamp to [0, 100]
     score = max(0, min(100, score))
+
+    # --- Confidence (how reliable is this assessment?) ---
+    # Confidence degrades for short or ambiguous content.  When confidence
+    # is low the score is directional at best — callers should weight it
+    # accordingly and not treat it as a definitive pass or fail.
+    confidence = 80
+    if word_count < 100:
+        confidence = 30
+    elif word_count < 300:
+        confidence = 50
+    elif word_count < 500:
+        confidence = 65
+    if trusted:
+        confidence = min(100, confidence + 10)
 
     # --- Risk level and recommendation ---
     # When confidence is low and no clear signals fired in either direction,
@@ -824,20 +1041,14 @@ def assess_credibility(text: str, url: str) -> CredibilityReport:
         risk_level = "high"
         recommendation = "avoid"
 
-    # --- Confidence (how reliable is this assessment?) ---
-    # Lower confidence for very short content or ambiguous signals
-    confidence = 80
-    if word_count < 100:
-        confidence = 30
-    elif word_count < 300:
-        confidence = 50
-    elif word_count < 500:
-        confidence = 65
-    if trusted:
-        confidence = min(100, confidence + 10)
-
     # --- Summary ---
-    if not detected_tactics and not positive_signals:
+    if no_signals and confidence < 65:
+        summary = (
+            f"Content is too short or ambiguous to score reliably "
+            f"({word_count} words, confidence {confidence}). "
+            "Defaulting to medium risk — human review required."
+        )
+    elif not detected_tactics and not positive_signals:
         summary = (
             "Content shows no strong credibility signals in either direction. "
             "Assessment is inconclusive — treat as medium confidence."

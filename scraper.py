@@ -225,6 +225,135 @@ def scrape(
 
 
 # ---------------------------------------------------------------------------
+# Raw HTML fetcher (for credibility layer)
+# ---------------------------------------------------------------------------
+
+
+def fetch_raw_html(
+    url: str,
+    force_dynamic: bool = False,
+    force_static: bool = False,
+) -> str:
+    """Fetch a URL and return the unprocessed HTML string.
+
+    Uses the same hybrid logic as scrape() but returns raw HTML instead of
+    cleaned plain text.  Intended to be called alongside scrape() when the
+    caller needs both the cleaned text and the raw HTML for the credibility
+    hidden-injection scanner.
+
+    The raw HTML is not cleaned or filtered in any way — it contains all
+    hidden elements, HTML comments, meta tags, and style attributes that
+    clean_html() would strip.
+
+    Args:
+        url:           Fully-qualified URL to fetch.
+        force_dynamic: Skip static attempt and use Playwright directly.
+        force_static:  Use requests only — no browser fallback.
+
+    Returns:
+        Raw HTML string.  Empty string on any fetch failure.
+    """
+    if force_dynamic:
+        return _fetch_raw_dynamic(url)
+
+    if force_static:
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=15)
+            response.raise_for_status()
+            return response.text
+        except Exception:
+            return ""
+
+    # Hybrid: static first
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        if len(response.text.strip()) >= _STATIC_MIN_CHARS:
+            return response.text
+    except Exception:
+        pass
+
+    return _fetch_raw_dynamic(url)
+
+
+def _fetch_raw_dynamic(url: str) -> str:
+    """Fetch raw HTML via Playwright without cleaning."""
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: PLC0415
+        from playwright_stealth import stealth_sync  # noqa: PLC0415
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(extra_http_headers=HEADERS)
+            page = context.new_page()
+            stealth_sync(page)
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            time.sleep(random.uniform(1.5, 3.0))
+            html = page.content()
+            browser.close()
+        return html
+    except Exception:
+        return ""
+
+
+def scrape_with_raw(
+    url: str,
+    force_dynamic: bool = False,
+    force_static: bool = False,
+) -> tuple[str, str]:
+    """Scrape a URL and return both cleaned text and raw HTML.
+
+    Runs a single fetch (respecting force flags and hybrid fallback logic)
+    and returns both outputs without a second network request.
+
+    Args:
+        url:           Fully-qualified URL to scrape.
+        force_dynamic: Skip static attempt and use Playwright directly.
+        force_static:  Use requests only — no browser fallback.
+
+    Returns:
+        (clean_text, raw_html) tuple.  On failure, clean_text begins with
+        'ERROR: ' and raw_html is an empty string.
+    """
+    if force_dynamic:
+        raw = _fetch_raw_dynamic(url)
+        if not raw:
+            return "ERROR: dynamic fetch returned empty", ""
+        return clean_html(raw), raw
+
+    if force_static:
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=15)
+            response.raise_for_status()
+            return clean_html(response.text), response.text
+        except Exception as exc:
+            return f"ERROR: {type(exc).__name__}: {exc}", ""
+
+    # Hybrid
+    fallback_reason: Optional[str] = None
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        raw = response.text
+        cleaned = clean_html(raw)
+        if len(cleaned.strip()) >= _STATIC_MIN_CHARS:
+            return cleaned, raw
+        fallback_reason = (
+            f"static result too short ({len(cleaned.strip())} chars "
+            f"< {_STATIC_MIN_CHARS} threshold)"
+        )
+    except Exception as exc:
+        fallback_reason = f"static fetch failed ({type(exc).__name__}: {exc})"
+
+    print(
+        f"[fallback] Switching to dynamic scraper — {fallback_reason}",
+        file=sys.stderr,
+    )
+    raw = _fetch_raw_dynamic(url)
+    return (clean_html(raw) if raw else "ERROR: dynamic fetch returned empty"), raw
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
